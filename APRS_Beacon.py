@@ -5,7 +5,7 @@
 # Author:      9A4AM
 #
 # Created:     29.01.2026
-# Updated:     30.01.2026 (Config GUI + Autostart fix + Comment multiline)
+# Updated:     30.01.2026 (Stateless APRS-IS connection)
 # Copyright:   (c) 9A4AM 2026
 # Licence:
 #-------------------------------------------------------------------------------
@@ -28,7 +28,7 @@ BTN_COLOR = "#2d2d2d"
 BTN_ACTIVE = "#3a3a3a"
 STATUS_RED = "#8b0000"
 STATUS_GREEN = "#006400"
-TITLE_COLOR = "#d4af37"  # gold
+TITLE_COLOR = "#d4af37"
 
 FONT_MAIN = ("Segoe UI", 11)
 FONT_LOG = ("Consolas", 11)
@@ -76,17 +76,14 @@ def load_config():
     return {
         "server": cfg["APRS_Data"]["Server"],
         "port": int(cfg["APRS_Data"]["Port"]),
-        "interval": int(cfg["APRS_Data"]["Time"]),   # minutes
+        "interval": int(cfg["APRS_Data"]["Time"]),
         "symbol": cfg["APRS_Data"]["Symbol"],
         "comment": cfg["APRS_Data"]["Comment"],
-
         "lat": float(cfg["Location"]["Latitude"]),
         "lon": float(cfg["Location"]["Longitude"]),
-
         "call": cfg["Personal_Data"]["Call"],
         "ssid": cfg["Personal_Data"]["SSID"],
         "password": cfg["Personal_Data"]["Password"],
-
         "autostart": cfg["App"].getboolean("Start")
     }
 
@@ -99,14 +96,11 @@ def save_config(cfg):
     parser["APRS_Data"]["Time"] = str(cfg["interval"])
     parser["APRS_Data"]["Symbol"] = cfg["symbol"]
     parser["APRS_Data"]["Comment"] = cfg["comment"]
-
     parser["Location"]["Latitude"] = str(cfg["lat"])
     parser["Location"]["Longitude"] = str(cfg["lon"])
-
     parser["Personal_Data"]["Call"] = cfg["call"]
     parser["Personal_Data"]["SSID"] = cfg["ssid"]
     parser["Personal_Data"]["Password"] = cfg["password"]
-
     parser["App"]["Start"] = "1" if cfg["autostart"] else "0"
 
     with open(CONFIG_FILE, "w") as f:
@@ -125,37 +119,153 @@ def build_packet(cfg):
     return f"{cfg['call']}{ssid}>APU25N,TCPIP*:@{timestamp}{lat}/{lon}{symbol}{cfg['comment']}"
 
 # ===============================
-# APRS Sender
+# APRS Sender (STATELESS)
 # ===============================
 
 class APRSSender:
     def __init__(self, log_func):
-        self.sock = None
         self.log = log_func
         self.packet_count = 0
 
-    def connect(self, cfg):
-        self.sock = socket.create_connection((cfg["server"], cfg["port"]), timeout=10)
-        login = f"user {cfg['call']} pass {cfg['password']} vers PY-APRS\n"
-        self.sock.sendall(login.encode())
-        time.sleep(1)
-        self.log("Connected to APRS-IS")
+    def send_beacon(self, cfg, retries=2, retry_delay=3):
+        attempt = 0
 
-    def disconnect(self):
+        while attempt <= retries:
+            sock = None
+            try:
+                sock = socket.create_connection((cfg["server"], cfg["port"]), timeout=10)
+
+                login = f"user {cfg['call']} pass {cfg['password']} vers PY-APRS\n"
+                sock.sendall(login.encode())
+                time.sleep(1)
+
+                packet = build_packet(cfg)
+                sock.sendall((packet + "\n").encode())
+
+                self.packet_count += 1
+                self.log(f"Sent: {packet}")
+                return  # uspjeh → izlaz
+
+            except Exception as e:
+                attempt += 1
+                if attempt > retries:
+                    raise  # pusti GUI da pokaže error
+                self.log(f"Send failed (attempt {attempt}/{retries}), retrying...")
+                time.sleep(retry_delay)
+
+            finally:
+                if sock:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                        sock.close()
+                    except Exception:
+                        pass
+
+
+# ===============================
+# Main GUI
+# ===============================
+
+class APRSGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("APRS Beacon Sender")
+        self.geometry("750x600")
+        self.configure(bg=BG_COLOR)
+
+        self.cfg = load_config()
+        self.sender = APRSSender(self.log)
+        self.running = True
+        self.beacon_thread = None
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.iconbitmap("earth.ico")
+
+        title = tk.Label(self, text="APRS Beacon sender by 9A4AM © 2026",
+                         bg=BG_COLOR, fg=TITLE_COLOR, font=FONT_TITLE)
+        title.pack(fill="x")
+
+        self.lbl_callsign = tk.Label(
+            self,
+            text=f"CALLSIGN: {self.get_callsign_text()}",
+            bg=BG_COLOR,
+            fg="#00c8ff",
+            font=("Segoe UI", 12, "bold"),
+            pady=4
+        )
+        self.lbl_callsign.pack(fill="x")
+
+
+        self.status = tk.Label(self, text="Idle", bg=STATUS_RED,
+                               fg="white", font=FONT_STATUS)
+        self.status.pack(fill="x")
+
+        self.logbox = scrolledtext.ScrolledText(
+            self, height=20, bg=BG_COLOR, fg=FG_COLOR,
+            insertbackground="white", font=FONT_LOG)
+        self.logbox.pack(fill="both", expand=True, padx=6, pady=6)
+
+        frame = tk.Frame(self, bg=BG_COLOR)
+        frame.pack(pady=6)
+
+        tk.Button(frame, text="Send Beacon", command=self.send_once,
+                  width=16, bg=BTN_COLOR, fg=FG_COLOR,
+                  activebackground=BTN_ACTIVE, relief="flat").pack(side="left", padx=6)
+
+        tk.Button(frame, text="Config", command=self.open_config,
+                  width=16, bg=BTN_COLOR, fg=FG_COLOR,
+                  activebackground=BTN_ACTIVE, relief="flat").pack(side="left", padx=6)
+
+        self.counter = tk.Label(self, text="Packets: 0",
+                                bg=BG_COLOR, fg=FG_COLOR, font=FONT_MAIN)
+        self.counter.pack(pady=4)
+
+        if self.cfg["autostart"]:
+            self.after(1000, self.start_beacon)
+
+    def get_callsign_text(self):
+        if self.cfg["ssid"]:
+            return f"{self.cfg['call']}-{self.cfg['ssid']}"
+        return self.cfg["call"]
+
+    def log(self, msg):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.logbox.insert(tk.END, f"[{ts}] {msg}\n")
+        self.logbox.see(tk.END)
+
+    def send_once(self):
         try:
-            if self.sock:
-                self.sock.shutdown(socket.SHUT_RDWR)
-                self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
-        self.log("Disconnected")
+            self.status.config(text="Sending...", bg=STATUS_RED)
+            self.sender.send_beacon(self.cfg)
+            self.counter.config(text=f"Packets: {self.sender.packet_count}")
+            self.status.config(text="Idle", bg=STATUS_GREEN)
+        except Exception as e:
+            self.status.config(text="Error", bg=STATUS_RED)
+            messagebox.showerror("Send error", str(e))
 
-    def send_beacon(self, cfg):
-        packet = build_packet(cfg)
-        self.sock.sendall((packet + "\n").encode())
-        self.packet_count += 1
-        self.log(f"TX: {packet}")
+    def start_beacon(self):
+        if self.beacon_thread and self.beacon_thread.is_alive():
+            return
+        self.beacon_thread = threading.Thread(target=self.beacon_loop, daemon=True)
+        self.beacon_thread.start()
+
+    def beacon_loop(self):
+        while self.running:
+            self.send_once()
+            time.sleep(self.cfg["interval"] * 60)
+
+    def open_config(self):
+        ConfigWindow(self, self.cfg, self.apply_config)
+
+    def apply_config(self, new_cfg):
+        self.cfg = new_cfg
+        self.lbl_callsign.config(text=f"CALLSIGN: {self.get_callsign_text()}")
+        self.log("Config updated")
+
+    def on_close(self):
+        self.running = False
+        self.destroy()
 
 # ===============================
 # Config window
@@ -287,169 +397,6 @@ class ConfigWindow(tk.Toplevel):
         save_config(self.cfg)
         self.save_callback(self.cfg)  # update main GUI
         self.destroy()
-
-# ===============================
-# Main GUI
-# ===============================
-
-class APRSGUI(tk.Tk):
-    def __init__(self):
-        super().__init__()
-
-        self.title("APRS Beacon Sender")
-        self.geometry("750x600")
-        self.configure(bg=BG_COLOR)
-
-        self.cfg = load_config()
-        self.sender = APRSSender(self.log)
-        self.beacon_thread = None
-        self.running = True
-
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.iconbitmap("earth.ico")
-        self.ever_connected = False
-
-
-
-        # Title
-        title = tk.Label(self, text="APRS Beacon sender by 9A4AM © 2026", bg=BG_COLOR, fg=TITLE_COLOR, font=FONT_TITLE, pady=6)
-        title.pack(fill="x")
-
-        # Status bar
-        self.status = tk.Label(self, text="Disconnected", bg=STATUS_RED, fg="white", font=FONT_STATUS, pady=6)
-        self.status.pack(fill="x")
-
-        # Autostart indicator
-        self.lbl_autostart = tk.Label(self, bg=BG_COLOR, fg="white", font=FONT_MAIN, pady=4)
-        self.lbl_autostart.pack(fill="x")
-        self.update_autostart_label()
-
-        # Log window
-        self.logbox = scrolledtext.ScrolledText(self, height=20, bg=BG_COLOR, fg=FG_COLOR, insertbackground="white", font=FONT_LOG)
-        self.logbox.pack(fill="both", expand=True, padx=6, pady=6)
-
-        # Buttons
-        frame = tk.Frame(self, bg=BG_COLOR)
-        frame.pack(pady=6)
-
-        def dark_button(text, cmd, col):
-            tk.Button(frame, text=text, command=cmd, width=14, bg=BTN_COLOR, fg=FG_COLOR,
-                      activebackground=BTN_ACTIVE, activeforeground=FG_COLOR, relief="flat", font=FONT_MAIN).grid(row=0, column=col, padx=6)
-
-        dark_button("Connect", self.connect, 0)
-        dark_button("Disconnect", self.disconnect, 1)
-        dark_button("Send Beacon", self.send_once, 2)
-        dark_button("Config", self.open_config, 3)
-        dark_button("Reload Config", self.reload_cfg, 4)
-
-        # Packet counter
-        self.counter = tk.Label(self, text="Packets: 0", bg=BG_COLOR, fg=FG_COLOR, font=FONT_MAIN)
-        self.counter.pack(pady=4)
-
-        if self.cfg["autostart"]:
-            self.after(1000, self.start_beacon)
-
-    # ---------------------------
-
-    def log(self, msg):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.logbox.insert(tk.END, f"[{timestamp}] {msg}\n")
-        self.logbox.see(tk.END)
-
-    def connect(self):
-        try:
-            self.sender.connect(self.cfg)
-            self.status.config(text="Connected", bg=STATUS_GREEN)
-            self.ever_connected = True
-        except Exception as e:
-            raise e
-
-
-    def disconnect(self):
-        self.sender.disconnect()
-        self.status.config(text="Disconnected", bg=STATUS_RED)
-
-    def send_once(self):
-        try:
-            self.sender.send_beacon(self.cfg)
-            self.counter.config(text=f"Packets: {self.sender.packet_count}")
-        except Exception as e:
-            messagebox.showerror("Send error", str(e))
-
-    def reload_cfg(self):
-        self.cfg = load_config()
-        self.log("Config reloaded")
-        self.update_autostart_label()
-
-    def update_autostart_label(self):
-        if self.cfg["autostart"]:
-            self.lbl_autostart.config(text="Autostart: ENABLED", fg="#00FF00")
-        else:
-            self.lbl_autostart.config(text="Autostart: DISABLED", fg="#FFFF00")
-
-    def start_beacon(self):
-        if self.beacon_thread and self.beacon_thread.is_alive():
-            return
-        self.beacon_thread = threading.Thread(target=self.beacon_loop, daemon=True)
-        self.beacon_thread.start()
-
-    def beacon_loop(self):
-        while self.running:
-            try:
-
-                if not self.sender.sock:
-                    self.connect()
-                    self.sender.send_beacon(self.cfg)
-                    self.counter.config(text=f"Packets: {self.sender.packet_count}")
-                else:
-                    self.sender.send_beacon(self.cfg)
-                    self.counter.config(text=f"Packets: {self.sender.packet_count}")
-
-            except Exception as e:
-                self.log(f"Error: {e}")
-                self.sender.disconnect()
-
-                # retry logic
-                if self.ever_connected:
-                    for attempt in range(1, 3):
-                        if not self.running:
-                            return
-
-                        self.log(f"Reconnect attempt {attempt}/2 in 60 seconds...")
-                        time.sleep(60)
-
-                        try:
-                            self.connect()
-                            self.sender.send_beacon(self.cfg)
-                            self.counter.config(text=f"Packets: {self.sender.packet_count}")
-                            break
-                        except Exception as e:
-                            self.log(f"Reconnect attempt {attempt} failed: {e}")
-                            self.sender.disconnect()
-
-            time.sleep(self.cfg["interval"] * 60)
-
-
-
-    def open_config(self):
-        ConfigWindow(self, self.cfg, self.apply_config)
-
-    def apply_config(self, new_cfg):
-        self.cfg = new_cfg
-        self.update_autostart_label()
-        self.log("Config applied from GUI")
-
-    def on_close(self):
-        self.running = False
-        try:
-            self.sender.disconnect()
-        except Exception:
-            pass
-        self.destroy()
-
-# ===============================
-# Main
-# ===============================
 
 if __name__ == "__main__":
     app = APRSGUI()
