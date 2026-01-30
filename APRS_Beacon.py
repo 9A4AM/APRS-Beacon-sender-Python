@@ -5,9 +5,9 @@
 # Author:      9A4AM
 #
 # Created:     29.01.2026
-# Updated:     29.01.2026 (Config GUI + Autostart fix + Comment multiline)
+# Updated:     30.01.2026 (Config GUI + Autostart fix + Comment multiline)
 # Copyright:   (c) 9A4AM 2026
-# Licence:     <your licence>
+# Licence:
 #-------------------------------------------------------------------------------
 
 import socket
@@ -158,7 +158,7 @@ class APRSSender:
         self.log(f"TX: {packet}")
 
 # ===============================
-# Config window (popravljeno)
+# Config window
 # ===============================
 
 class ConfigWindow(tk.Toplevel):
@@ -232,7 +232,7 @@ class ConfigWindow(tk.Toplevel):
         row += 1
 
         add_label("Comment:")
-        # Multiline Text za Comment
+        # Multiline Text for Comment
         self.entries["comment"] = tk.Text(self, font=FONT_MAIN, height=4, width=40, bg=BG_COLOR, fg=FG_COLOR, insertbackground="white")
         self.entries["comment"].grid(row=row, column=1, padx=5, pady=4)
         self.entries["comment"].insert("1.0", cfg["comment"])
@@ -244,7 +244,7 @@ class ConfigWindow(tk.Toplevel):
         self.symbol_cb.set(cfg["symbol"])
         row += 1
 
-        # Autostart fix + vidljiva kvačica
+
         add_label("Autostart:")
         self.autostart_var = tk.IntVar()
         self.autostart_var.set(1 if cfg["autostart"] else 0)
@@ -307,6 +307,8 @@ class APRSGUI(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.iconbitmap("earth.ico")
+        self.ever_connected = False
+
 
 
         # Title
@@ -358,8 +360,10 @@ class APRSGUI(tk.Tk):
         try:
             self.sender.connect(self.cfg)
             self.status.config(text="Connected", bg=STATUS_GREEN)
+            self.ever_connected = True
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            raise e
+
 
     def disconnect(self):
         self.sender.disconnect()
@@ -392,14 +396,40 @@ class APRSGUI(tk.Tk):
     def beacon_loop(self):
         while self.running:
             try:
+
                 if not self.sender.sock:
                     self.connect()
-                self.sender.send_beacon(self.cfg)
-                self.counter.config(text=f"Packets: {self.sender.packet_count}")
+                    self.sender.send_beacon(self.cfg)
+                    self.counter.config(text=f"Packets: {self.sender.packet_count}")
+                else:
+                    self.sender.send_beacon(self.cfg)
+                    self.counter.config(text=f"Packets: {self.sender.packet_count}")
+
             except Exception as e:
-                self.log(str(e))
+                self.log(f"Error: {e}")
                 self.sender.disconnect()
+
+                # retry logic
+                if self.ever_connected:
+                    for attempt in range(1, 3):
+                        if not self.running:
+                            return
+
+                        self.log(f"Reconnect attempt {attempt}/2 in 60 seconds...")
+                        time.sleep(60)
+
+                        try:
+                            self.connect()
+                            self.sender.send_beacon(self.cfg)
+                            self.counter.config(text=f"Packets: {self.sender.packet_count}")
+                            break
+                        except Exception as e:
+                            self.log(f"Reconnect attempt {attempt} failed: {e}")
+                            self.sender.disconnect()
+
             time.sleep(self.cfg["interval"] * 60)
+
+
 
     def open_config(self):
         ConfigWindow(self, self.cfg, self.apply_config)
