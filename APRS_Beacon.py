@@ -63,6 +63,24 @@ SYMBOL_MAP = {
 
 SYMBOL_LIST = list(SYMBOL_MAP.keys())
 
+
+def wait_for_logresp(sock, timeout=5):
+    sock.settimeout(timeout)
+    start = time.time()
+
+    while time.time() - start < timeout:
+        data = sock.recv(1024)
+        if not data:
+            break
+
+        text = data.decode(errors="ignore")
+        for line in text.splitlines():
+            if "logresp" in line.lower():
+                return line.strip()
+
+    return None
+
+
 # ===============================
 # Config loader
 # ===============================
@@ -133,33 +151,49 @@ class APRSSender:
         while attempt <= retries:
             sock = None
             try:
-                sock = socket.create_connection((cfg["server"], cfg["port"]), timeout=10)
+                sock = socket.create_connection(
+                    (cfg["server"], cfg["port"]), timeout=10
+                )
 
+                # Login
                 login = f"user {cfg['call']} pass {cfg['password']} vers PY-APRS\n"
                 sock.sendall(login.encode())
-                time.sleep(1)
 
+                # Wait for logresp (VB6-style)
+                logresp = wait_for_logresp(sock, timeout=5)
+                if not logresp:
+                    raise RuntimeError("No logresp from APRS-IS server")
+
+                self.log(f"APRS-IS: {logresp}")
+
+                # Mandatory delay after connect + login
+                time.sleep(2)
+
+                # Send beacon
                 packet = build_packet(cfg)
                 sock.sendall((packet + "\n").encode())
 
+                # Give TCP time to flush
+                time.sleep(0.5)
+
                 self.packet_count += 1
                 self.log(f"Sent: {packet}")
-                return  # uspjeh → izlaz
+                return  # SUCCESS
 
             except Exception as e:
                 attempt += 1
                 if attempt > retries:
-                    raise  # pusti GUI da pokaže error
-                self.log(f"Send failed (attempt {attempt}/{retries}), retrying...")
+                    raise
+                self.log(f"Send failed ({attempt}/{retries}): {e}")
                 time.sleep(retry_delay)
 
             finally:
                 if sock:
                     try:
-                        sock.shutdown(socket.SHUT_RDWR)
                         sock.close()
                     except Exception:
                         pass
+
 
 
 # ===============================
@@ -236,7 +270,7 @@ class APRSGUI(tk.Tk):
 
     def send_once(self):
         try:
-            self.status.config(text="Sending...", bg=STATUS_RED)
+            self.status.config(text="Sending...", bg="#b8860b")
             self.sender.send_beacon(self.cfg)
             self.counter.config(text=f"Packets: {self.sender.packet_count}")
             self.status.config(text="Idle", bg=STATUS_GREEN)
